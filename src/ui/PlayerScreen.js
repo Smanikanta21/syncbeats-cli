@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Box, Text, useInput, useApp } from 'ink';
+import { Box, Text, useInput, useApp, useStdout } from 'ink';
 import TextInput from './TextInput.js';
 import { syncBeatsClient } from '../core/syncBeatsClient.js';
 import { syncEngine } from '../core/syncEngine.js';
@@ -13,8 +13,16 @@ function formatTime(seconds) {
   return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
 }
 
+function queueIndex(queue, selection) {
+  if (!queue.length) return -1;
+  const byId = queue.findIndex(item => item.id === selection.id);
+  return byId >= 0 ? byId : Math.max(0, Math.min(selection.index, queue.length - 1));
+}
+
 export function PlayerScreen({ roomId: initialRoomId, onBack }) {
   const { exit } = useApp();
+  const { stdout } = useStdout();
+  const [terminalRows, setTerminalRows] = useState(stdout.rows || 24);
   const [roomState, setRoomState] = useState(null);
   const [syncStats, setSyncStats] = useState({ latency: null, offset: 0 });
   const [buffering, setBuffering] = useState(false);
@@ -25,13 +33,34 @@ export function PlayerScreen({ roomId: initialRoomId, onBack }) {
   const [driftInfo, setDriftInfo] = useState({ tier: 'measuring', expected: 0, driftMs: null });
   const [downloadProgress, setDownloadProgress] = useState(null);
   const [queueState, setQueueState] = useState('none');
-  const [queueSelectedIndex, setQueueSelectedIndex] = useState(0);
+  const [queueSelection, setQueueSelection] = useState({ id: null, index: 0 });
+  const queue = roomState?.queue || [];
+  const queueSelectedIndex = queueIndex(queue, queueSelection);
+  const visibleCount = Math.max(1, Math.min(10, terminalRows - 20));
+  const queueStart = Math.max(0, Math.min(queueSelectedIndex - Math.floor(visibleCount / 2), queue.length - visibleCount));
+  const visibleQueue = queue.slice(queueStart, queueStart + visibleCount);
+
+  useEffect(() => {
+    const resize = () => setTerminalRows(stdout.rows || 24);
+    stdout.on('resize', resize);
+    return () => stdout.off('resize', resize);
+  }, [stdout]);
+  useEffect(() => {
+    setQueueSelection(current => {
+      const index = queueIndex(queue, current), id = queue[index]?.id || null;
+      return current.id === id && current.index === index ? current : { id, index };
+    });
+  }, [roomState?.queue]);
   
   const [error, setError] = useState(null);
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   useEffect(() => {
 
-    const onRoomState = (state) => setRoomState(state);
+    const onRoomState = state => setRoomState(state ? {
+      ...state,
+      queue: [...(state.queue || [])],
+      participants: [...(state.participants || [])],
+    } : null);
     const onStats = (stats) => setSyncStats(stats);
     const onBuffering = (isBuffering) => {
       setBuffering(isBuffering);
@@ -84,28 +113,26 @@ export function PlayerScreen({ roomId: initialRoomId, onBack }) {
       return; // let TextInput handle the rest
     }
 
-    if (queueState === 'focused') {
-      if (key.escape) {
-        setQueueState('none');
-      } else if (key.upArrow) {
-        setQueueSelectedIndex(Math.max(0, queueSelectedIndex - 1));
-      } else if (key.downArrow) {
-        setQueueSelectedIndex(Math.min((roomState?.queue?.length || 1) - 1, queueSelectedIndex + 1));
-      } else if (key.return && roomState?.queue?.[queueSelectedIndex]) {
-        syncBeatsClient.jumpToQueueItem(roomState.queue[queueSelectedIndex].id);
-        setQueueState('none');
-      }
-      return;
-    }
-
-    if (input === 'q' || input === 'Q') {
-      exit();
-      return;
-    }
+    if (input === 'q' || input === 'Q') { exit(); return; }
     if (input === 'b' || input === 'B') { onBack?.(); return; }
     if (input === 'm' || input === 'M') {
+      setQueueState(current => current === 'focused' ? 'none' : 'focused');
+      return;
+    }
+    if (key.escape && queueState === 'focused') { setQueueState('none'); return; }
+    if (key.upArrow || key.downArrow) {
       setQueueState('focused');
-      setQueueSelectedIndex(0);
+      setQueueSelection(current => {
+        const index = queueIndex(queue, current);
+        if (index < 0) return { id: null, index: 0 };
+        const next = Math.max(0, Math.min(queue.length - 1, index + (key.downArrow ? 1 : -1)));
+        return { id: queue[next].id, index: next };
+      });
+      return;
+    }
+    if (key.return && queueState === 'focused') {
+      if (queue[queueSelectedIndex]) syncBeatsClient.jumpToQueueItem(queue[queueSelectedIndex].id);
+      return;
     }
     if (input === 'r' || input === 'R') {
       syncBeatsClient.toggleRepeat();
@@ -158,7 +185,7 @@ export function PlayerScreen({ roomId: initialRoomId, onBack }) {
   return (
     <Box minHeight="100%" minWidth="100%" flexDirection="column" borderStyle="round" borderColor="cyan">
       {/* Header */}
-      <Box borderStyle="round" borderColor="green" padding={1} marginBottom={1} justifyContent="space-between">
+      <Box borderStyle="round" borderColor="green" paddingX={1} marginBottom={1} justifyContent="space-between">
         <Text bold color="greenBright">SyncBeats Terminal</Text>
         <Text color="gray">Room: {initialRoomId}</Text>
       </Box>
@@ -200,13 +227,13 @@ export function PlayerScreen({ roomId: initialRoomId, onBack }) {
         <Box width="60%" flexDirection="column" paddingRight={2}>
           
           {/* Now Playing */}
-          <Box borderStyle="round" borderColor="magenta" padding={1} flexDirection="column" flexBasis="50%">
+          <Box borderStyle="round" borderColor="magenta" paddingX={1} flexDirection="column">
             <Text bold color="magentaBright">Now Playing</Text>
             {currentTrack ? (
               <>
-                <Text bold>{currentTrack.title}</Text>
-                <Text color="gray">{currentTrack.artist}</Text>
-                <Box marginTop={1}>
+                <Text bold wrap="truncate-end">{currentTrack.title}</Text>
+                <Text color="gray" wrap="truncate-end">{currentTrack.artist}</Text>
+                <Box>
                   {buffering ? (
                     <Box flexDirection="column">
                       <Text color="yellow">
@@ -228,7 +255,7 @@ export function PlayerScreen({ roomId: initialRoomId, onBack }) {
                       <Text color={roomState?.state?.toUpperCase() === 'PLAYING' ? 'green' : 'yellow'}>
                         {roomState?.state?.toUpperCase() === 'PLAYING' ? '> Playing' : '|| Paused'}
                       </Text>
-                      <Box marginTop={1} flexDirection="row" alignItems="center">
+                      <Box flexDirection="row" alignItems="center">
                         <Text color="cyan">{formatTime(driftInfo.expected)} </Text>
                         <Text color="gray"> (Duration unknown)</Text>
                       </Box>
@@ -242,13 +269,17 @@ export function PlayerScreen({ roomId: initialRoomId, onBack }) {
           </Box>
 
           {/* Queue */}
-          <Box borderStyle="round" borderColor="blue" padding={1} flexDirection="column" flexGrow={1} marginTop={1}>
-            <Text bold color="blueBright">Queue</Text>
-            {(roomState?.queue || []).map((q, i) => (
-              <Text key={q.id} color={q.isCurrent ? 'cyan' : 'white'}>
-                {queueState === 'focused' && i === queueSelectedIndex ? '> ' : ''}{i + 1}. {q.title} {q.isCurrent ? '←' : ''}
-              </Text>
-            ))}
+          <Box borderStyle="round" borderColor={queueState === 'focused' ? 'cyan' : 'blue'} paddingX={1} flexDirection="column" flexGrow={1} marginTop={1}>
+            <Text bold color={queueState === 'focused' ? 'cyanBright' : 'blueBright'}>
+              Queue{queue.length ? ` (${queueSelectedIndex + 1}/${queue.length})` : ''}
+            </Text>
+            {visibleQueue.map((q, offset) => {
+              const index = queueStart + offset, selected = queueState === 'focused' && index === queueSelectedIndex;
+              return <Text key={q.id} wrap="truncate-end" inverse={selected} bold={selected} color={selected || q.isCurrent ? 'cyan' : 'white'}>
+                {selected ? '> ' : '  '}{index + 1}. {q.title} {q.isCurrent ? '←' : ''}
+              </Text>;
+            })}
+            {!queue.length && <Text color="gray">Queue is empty. Press S to add music.</Text>}
           </Box>
         </Box>
 
@@ -277,7 +308,9 @@ export function PlayerScreen({ roomId: initialRoomId, onBack }) {
       {/* Footer Controls */}
       <Box marginTop={1} justifyContent="center">
         <Text color="gray">
-          [SPACE] Play/Pause • [N] Next • [P] Prev • [R] Repeat • [M] Queue • [S] Search • [B] Rooms • [Q] Quit
+          {queueState === 'focused'
+            ? '[↑/↓] Move • [Enter] Play • [M/Esc] Done • [Space] Play/Pause • [Q] Quit'
+            : '[Space] Play/Pause • [N/P] Skip • [S] Search • [M] Queue • [Q] Quit'}
         </Text>
       </Box>
     </Box>

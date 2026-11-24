@@ -62,11 +62,14 @@ Enter a room code, or leave it empty to use your own existing/server-assigned ro
 | Space | Play / pause |
 | N / P | Next / previous track |
 | R | Cycle repeat: off, all, track |
-| M | Focus queue; arrows select, Enter plays |
+| Up / Down | Focus the queue and move its cursor |
+| M | Toggle queue focus; Enter plays the selected track |
 | S | Search; arrows select a result, Enter enqueues |
 | Esc | Leave search/queue mode |
 | B | Choose another room |
 | Q / Ctrl+C | Quit and restore the terminal |
+
+The queue scrolls to keep its cursor visible and preserves the selected track when rows are reordered or removed. Playback shortcuts remain available while the queue is focused.
 
 Commands round-trip through the backend. Offline controls are rejected rather than buffered. After reconnecting, the client rejoins the room and redeclares readiness for cached audio.
 

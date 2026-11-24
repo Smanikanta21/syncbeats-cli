@@ -31,3 +31,7 @@ The fixtures follow the current SyncBeats REST/Socket.IO contract and use fake l
 Physical speaker alignment below 25ms is not certified. FFplay process/device latency and real networks require two-device testing. Real Google consent, email/OTP delivery and live YouTube extraction were not completed with a real account. Browser handoff requires the web login page to complete the token callback; an existing authenticated browser session can redirect to the hub, so email login remains available. Other operating systems have not been tested locally.
 
 Run `npm test` to repeat the regression suite; see the README for configuration and package usage.
+
+## Queue cursor follow-up
+
+The cursor now focuses automatically on arrow-key input, keeps its row visible through scrolling/resizing, and preserves selection by track ID across queue changes. Queue snapshots are copied into React state so event updates redraw immediately. M toggles focus; playback shortcuts remain available while focused. Three UI regressions reproduce and verify these paths. The complete 35-test suite passed on Node 22 with no skips.
