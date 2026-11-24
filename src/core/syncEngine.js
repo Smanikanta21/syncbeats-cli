@@ -1,83 +1,67 @@
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'node:events';
 import { audioEngine } from './audioEngine.js';
+import { PARAM_TABLE } from './syncParameters.js';
 
 export class SyncEngine extends EventEmitter {
-  constructor() {
-    super();
-    this.startEpoch = null;
-    this.pauseOffset = 0;
-    this.clockOffset = 0;
-    this.state = 'idle'; // idle, playing, paused, buffering
-    this.driftCheckInterval = null;
-    this.syncLatency = 0;
-    this.lastDriftTier = 'synced';
+  constructor({ audio = audioEngine, now = () => Date.now() } = {}) {
+    super(); this.audio = audio; this.now = now;
+    this.startEpoch = null; this.pauseOffset = 0; this.clockOffset = 0; this.clockReady = false;
+    this.state = 'idle'; this.syncLatency = null; this.params = { ...PARAM_TABLE.good };
+    this.scheduleTimer = null; this.driftCheckInterval = null; this.trackFile = null; this.lastCorrection = -Infinity;
+    this.lastDriftTier = 'measuring';
   }
-
   setClockOffset(offset, latency) {
-    this.clockOffset = offset;
-    this.syncLatency = latency;
-    this.emit('stats', { latency: this.syncLatency, offset: this.clockOffset });
+    if (!Number.isFinite(offset) || !Number.isFinite(latency) || latency < 0) return;
+    this.clockOffset = offset; this.clockReady = true; this.syncLatency = latency;
+    this.emit('stats', { latency, offset });
   }
-
-  getServerNow() {
-    return Date.now() + this.clockOffset;
-  }
-
+  setParameters(params) { this.params = params; if (this.state === 'playing') this.startDriftCorrection(); }
+  getServerNow() { return this.now() + this.clockOffset; }
   getExpectedPositionSec() {
-    if (this.startEpoch == null) return this.pauseOffset;
-    return Math.max(0, (this.getServerNow() - this.startEpoch) / 1000);
+    return this.startEpoch == null ? this.pauseOffset : Math.max(0, (this.getServerNow() - this.startEpoch) / 1000);
   }
-
-  schedule(payload, trackUrl) {
-    this.state = 'playing';
-    this.startEpoch = payload.startEpoch;
-    this.pauseOffset = payload.fromPosition || 0;
-    
-    // Calculate when it should start
-    const expected = this.getExpectedPositionSec();
-    audioEngine.play(trackUrl, expected);
-    
-    this.startDriftCorrection(trackUrl);
-    this.emit('state', this.state);
+  schedule(payload, filePath) {
+    if (!Number.isFinite(payload.startEpoch)) throw new Error('The server returned an invalid playback timeline.');
+    this.cancelSchedule(); this.stopDriftCorrection();
+    this.startEpoch = payload.startEpoch; this.pauseOffset = Math.max(0, payload.fromPosition || 0); this.trackFile = filePath;
+    this.state = 'scheduled'; this.emit('state', this.state);
+    const atEpoch = Number.isFinite(payload.atEpoch) ? payload.atEpoch : this.getServerNow();
+    const start = () => {
+      const remaining = atEpoch - this.getServerNow();
+      if (remaining > 1) { this.scheduleTimer = setTimeout(start, remaining); return; }
+      this.scheduleTimer = null; this.state = 'playing'; this.lastCorrection = this.now();
+      this.audio.play(filePath, this.getExpectedPositionSec());
+      if (this.state !== 'playing') return;
+      this.startDriftCorrection(); this.emit('state', this.state);
+    };
+    this.scheduleTimer = setTimeout(start, Math.max(0, atEpoch - this.getServerNow()));
   }
-
-  pause(pauseOffset) {
-    this.state = 'paused';
-    this.pauseOffset = pauseOffset;
-    this.startEpoch = null;
-    audioEngine.pause();
-    this.stopDriftCorrection();
-    this.emit('state', this.state);
+  pause(position = 0) {
+    this.cancelSchedule(); this.stopDriftCorrection();
+    this.state = 'paused'; this.pauseOffset = Math.max(0, Number.isFinite(position) ? position : 0); this.startEpoch = null;
+    this.audio.pause(); this.emit('state', this.state);
+    this.emit('drift', { tier: 'paused', expected: this.pauseOffset, actual: null, driftMs: null });
   }
-
-  startDriftCorrection(trackUrl) {
-    this.stopDriftCorrection();
-    
-    // Run drift correction every 5 seconds
-    this.driftCheckInterval = setInterval(() => {
-      if (this.state !== 'playing' || !audioEngine.isPlaying) return;
-
-      // For child_process, we can't easily query the true playback position 
-      // without some complex stdout parsing from ffplay, or just assuming it
-      // runs at exactly 1x speed since it was spawned.
-      // So we track how long the child process has been alive.
-      // Wait, actually, afplay doesn't report position. So we assume:
-      // actual_position = (time_since_spawn) + initial_seek
-      // But instead of complex true position tracking, if we just want to ensure
-      // it stays in sync, we can just do a hard seek if we get a new schedule event.
-      // For now, terminal sync engine will just log drift tier based on latency.
-      
-      this.lastDriftTier = 'synced'; // child_process audio can't easily micro-rate
-      this.emit('drift', { tier: this.lastDriftTier, expected: this.getExpectedPositionSec() });
-    }, 1000);
-  }
-
-  stopDriftCorrection() {
-    if (this.driftCheckInterval) {
-      clearInterval(this.driftCheckInterval);
-      this.driftCheckInterval = null;
+  cancelSchedule() { if (this.scheduleTimer) clearTimeout(this.scheduleTimer); this.scheduleTimer = null; }
+  checkDrift() {
+    if (this.state !== 'playing') return;
+    const expected = this.getExpectedPositionSec(), actual = this.audio.getPosition();
+    if (actual == null || !this.clockReady) { this.emit('drift', { tier: 'measuring', expected, actual, driftMs: null }); return; }
+    const driftMs = (actual - expected) * 1000;
+    const correcting = Math.abs(driftMs) > this.params.hardSeek && this.now() - this.lastCorrection >= 1500;
+    const tier = Math.abs(driftMs) <= this.params.hardSeek ? 'synced' : correcting ? 'correcting' : 'settling';
+    this.lastDriftTier = tier; this.emit('drift', { tier, expected, actual, driftMs });
+    if (correcting && this.trackFile) {
+      this.lastCorrection = this.now();
+      // A new decoder takes time to start. Compensate using observed FFplay launch latency.
+      this.audio.play(this.trackFile, expected + Math.min(1000, this.audio.startupLatencyMs || 0) / 1000);
     }
   }
+  startDriftCorrection() { this.stopDriftCorrection(); this.driftCheckInterval = setInterval(() => this.checkDrift(), this.params.driftInterval); }
+  stopDriftCorrection() { if (this.driftCheckInterval) clearInterval(this.driftCheckInterval); this.driftCheckInterval = null; }
+  stop() {
+    this.cancelSchedule(); this.stopDriftCorrection(); this.audio.stop();
+    this.state = 'idle'; this.startEpoch = null; this.pauseOffset = 0; this.trackFile = null; this.emit('state', this.state);
+  }
 }
-
 export const syncEngine = new SyncEngine();

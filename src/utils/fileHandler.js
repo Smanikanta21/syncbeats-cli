@@ -1,6 +1,7 @@
 import { readdir, stat } from 'fs/promises';
 import path from 'path';
 import { existsSync, mkdirSync } from 'fs';
+import { CACHE_DIR } from '../core/config.js';
 
 /**
  * Reads the local music directory and returns an array of available audio tracks.
@@ -8,7 +9,7 @@ import { existsSync, mkdirSync } from 'fs';
  * @param {string} dirPath - The relative or absolute path to the music directory.
  * @returns {Promise<Array<{name: string, filename: string, path: string}>>}
  */
-export async function getMusicFiles(dirPath = './music') {
+export async function getMusicFiles(dirPath = path.join(CACHE_DIR, 'music')) {
   const musicDir = path.resolve(process.cwd(), dirPath);
   
   // Ensure the directory exists
@@ -24,8 +25,8 @@ export async function getMusicFiles(dirPath = './music') {
     for (const file of files) {
       const ext = path.extname(file).toLowerCase();
       
-      // Filter strictly for .mp3 and .wav
-      if (ext === '.mp3' || ext === '.wav') {
+      // Include formats supported by FFplay
+      if (['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac', '.opus', '.webm'].includes(ext)) {
         const fullPath = path.join(musicDir, file);
         const fileStat = await stat(fullPath);
         

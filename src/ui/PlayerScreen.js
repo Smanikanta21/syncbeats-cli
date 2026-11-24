@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Box, Text, useInput, useApp } from 'ink';
-import TextInput from 'ink-text-input';
+import TextInput from './TextInput.js';
 import { syncBeatsClient } from '../core/syncBeatsClient.js';
 import { syncEngine } from '../core/syncEngine.js';
 import { authService } from '../core/authService.js';
@@ -13,27 +13,23 @@ function formatTime(seconds) {
   return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
 }
 
-export function PlayerScreen({ roomId: initialRoomId }) {
+export function PlayerScreen({ roomId: initialRoomId, onBack }) {
   const { exit } = useApp();
   const [roomState, setRoomState] = useState(null);
-  const [syncStats, setSyncStats] = useState({ latency: 0, offset: 0 });
+  const [syncStats, setSyncStats] = useState({ latency: null, offset: 0 });
   const [buffering, setBuffering] = useState(false);
   const [searchState, setSearchState] = useState('none'); // 'none', 'input', 'loading', 'results'
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
   const [searchSelectedIndex, setSearchSelectedIndex] = useState(0);
-  const [driftInfo, setDriftInfo] = useState({ tier: 'synced', expected: 0 });
+  const [driftInfo, setDriftInfo] = useState({ tier: 'measuring', expected: 0, driftMs: null });
   const [downloadProgress, setDownloadProgress] = useState(null);
   const [queueState, setQueueState] = useState('none');
   const [queueSelectedIndex, setQueueSelectedIndex] = useState(0);
   
+  const [error, setError] = useState(null);
+  const [connectionStatus, setConnectionStatus] = useState('connecting');
   useEffect(() => {
-    // Start connection and join the selected room immediately
-    syncBeatsClient.connect();
-    // Ensure room exists in DB before joining so we can enqueue tracks
-    syncBeatsClient.createRoom(initialRoomId).then(() => {
-      syncBeatsClient.joinRoom(initialRoomId);
-    });
 
     const onRoomState = (state) => setRoomState(state);
     const onStats = (stats) => setSyncStats(stats);
@@ -45,6 +41,9 @@ export function PlayerScreen({ roomId: initialRoomId }) {
     const onProgress = (p) => setDownloadProgress(p.progress);
     const onReady = () => setDownloadProgress(100);
 
+    const onError = error => setError(error.message);
+    syncBeatsClient.on('clientError', onError);
+    syncBeatsClient.on('connectionStatus', setConnectionStatus);
     syncBeatsClient.on('roomState', onRoomState);
     syncBeatsClient.on('buffering', onBuffering);
     syncEngine.on('stats', onStats);
@@ -52,7 +51,11 @@ export function PlayerScreen({ roomId: initialRoomId }) {
     trackDownloader.on('progress', onProgress);
     trackDownloader.on('ready', onReady);
 
+    try { syncBeatsClient.joinRoom(initialRoomId); } catch (error) { setError(error.message); }
     return () => {
+      syncBeatsClient.off('clientError', onError);
+      syncBeatsClient.off('connectionStatus', setConnectionStatus);
+      syncBeatsClient.disconnect();
       syncBeatsClient.off('roomState', onRoomState);
       syncBeatsClient.off('buffering', onBuffering);
       syncEngine.off('stats', onStats);
@@ -60,7 +63,7 @@ export function PlayerScreen({ roomId: initialRoomId }) {
       trackDownloader.off('progress', onProgress);
       trackDownloader.off('ready', onReady);
     };
-  }, []);
+  }, [initialRoomId]);
 
   useInput((input, key) => {
     if (searchState !== 'none') {
@@ -73,7 +76,7 @@ export function PlayerScreen({ roomId: initialRoomId }) {
         } else if (key.downArrow) {
           setSearchSelectedIndex(Math.min(searchResults.slice(0, 5).length - 1, searchSelectedIndex + 1));
         } else if (key.return) {
-          syncBeatsClient.enqueueTrack(searchResults[searchSelectedIndex]);
+          syncBeatsClient.enqueueTrack(searchResults[searchSelectedIndex]).catch(error => setError(error.message));
           setSearchState('none');
           setSearchQuery('');
         }
@@ -97,8 +100,9 @@ export function PlayerScreen({ roomId: initialRoomId }) {
 
     if (input === 'q' || input === 'Q') {
       exit();
-      process.exit(0);
+      return;
     }
+    if (input === 'b' || input === 'B') { onBack?.(); return; }
     if (input === 'm' || input === 'M') {
       setQueueState('focused');
       setQueueSelectedIndex(0);
@@ -125,8 +129,10 @@ export function PlayerScreen({ roomId: initialRoomId }) {
   const handleSearchSubmit = async () => {
     if (searchQuery.trim()) {
       setSearchState('loading');
-      const results = await syncBeatsClient.searchTracks(searchQuery);
-      setSearchResults(results);
+      try {
+        const results = await syncBeatsClient.searchTracks(searchQuery);
+        setSearchResults(results);
+      } catch (error) { setError(error.message); setSearchResults([]); }
       setSearchSelectedIndex(0);
       setSearchState('results');
     } else {
@@ -142,7 +148,9 @@ export function PlayerScreen({ roomId: initialRoomId }) {
   if (!roomState) {
     return (
       <Box minHeight="100%" minWidth="100%" flexDirection="column" borderStyle="round" borderColor="cyan" justifyContent="center" alignItems="center">
-        <Text color="cyan">Connecting to Room {initialRoomId}...</Text>
+        <Text color="cyan">Room {initialRoomId}: {connectionStatus}</Text>
+        {error && <Text color="red">{error}</Text>}
+        <Text>[B] Choose another room • [Q] Quit</Text>
       </Box>
     );
   }
@@ -155,6 +163,7 @@ export function PlayerScreen({ roomId: initialRoomId }) {
         <Text color="gray">Room: {initialRoomId}</Text>
       </Box>
 
+      <Box flexDirection="column"><Text color="gray">Connection: {connectionStatus}</Text>{error && <Text color="red">{error}</Text>}</Box>
       {/* Search Bar */}
       {searchState !== 'none' && (
         <Box paddingX={2} paddingY={1} borderStyle="single" borderColor="yellow" flexDirection="column">
@@ -237,7 +246,7 @@ export function PlayerScreen({ roomId: initialRoomId }) {
             <Text bold color="blueBright">Queue</Text>
             {(roomState?.queue || []).map((q, i) => (
               <Text key={q.id} color={q.isCurrent ? 'cyan' : 'white'}>
-                {i + 1}. {q.title} {q.isCurrent ? '←' : ''}
+                {queueState === 'focused' && i === queueSelectedIndex ? '> ' : ''}{i + 1}. {q.title} {q.isCurrent ? '←' : ''}
               </Text>
             ))}
           </Box>
@@ -259,8 +268,8 @@ export function PlayerScreen({ roomId: initialRoomId }) {
           {/* Sync Stats */}
           <Box borderStyle="round" borderColor="yellow" padding={1} flexDirection="column" marginTop={1} height={6}>
             <Text bold color="yellowBright">Sync Status</Text>
-            <Text>{Math.round(syncStats.latency)}ms Latency</Text>
-            <Text>Drift: {driftInfo.tier}</Text>
+            <Text>{syncStats.latency == null ? 'Measuring latency...' : `${Math.round(syncStats.latency)}ms Latency`}</Text>
+            <Text>Drift: {driftInfo.tier}{driftInfo.driftMs == null ? '' : ` (${Math.round(driftInfo.driftMs)}ms)`}</Text>
           </Box>
         </Box>
       </Box>
@@ -268,7 +277,7 @@ export function PlayerScreen({ roomId: initialRoomId }) {
       {/* Footer Controls */}
       <Box marginTop={1} justifyContent="center">
         <Text color="gray">
-          [SPACE] Play/Pause • [N] Next • [P] Prev • [R] Repeat • [M] Queue • [S] Search • [Q] Quit
+          [SPACE] Play/Pause • [N] Next • [P] Prev • [R] Repeat • [M] Queue • [S] Search • [B] Rooms • [Q] Quit
         </Text>
       </Box>
     </Box>

@@ -1,0 +1,54 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import React from 'react';
+import { build } from 'esbuild';
+import { render, cleanup } from 'ink-testing-library';
+import { fixture, delay, waitFor } from './fixture.mjs';
+const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'syncbeats-ui-'));
+process.env.XDG_CONFIG_HOME = temp; process.env.SYNCBEATS_CACHE_DIR = temp;
+const service = await fixture(); process.env.SYNCBEATS_SERVER_URL = service.url;
+const cache = path.resolve('node_modules/.cache/syncbeats-ui-tests.mjs');
+await build({ stdin: { contents: "export {LoginScreen} from './src/ui/LoginScreen.js'; export {App} from './src/ui/App.js'; export {authService} from './src/core/authService.js';", resolveDir: process.cwd() }, outfile: cache, bundle: true, platform: 'node', format: 'esm', packages: 'external', loader: { '.js': 'jsx' } });
+const { LoginScreen, App, authService } = await import(cache);
+test.after(async () => { cleanup(); await service.close(); await fs.rm(temp, { recursive: true, force: true }); await fs.rm(cache, { force: true }); });
+const send = async (screen, text) => { screen.stdin.write(text); await delay(40); };
+test('Enter moves fields and submits email login exactly once', async () => {
+  authService.logout(); let completed = 0;
+  const screen = render(React.createElement(LoginScreen, { onLoginSuccess: () => completed++ })); await delay(30);
+  await send(screen, 'fixture@example.invalid'); await send(screen, '\r');
+  assert.equal(service.state.requests.filter(r => r.route === '/auth/login').length, 0);
+  await send(screen, 'fixture-password'); await send(screen, '\r');
+  await waitFor(() => completed === 1);
+  assert.equal(service.state.requests.filter(r => r.route === '/auth/login').length, 1);
+  screen.unmount();
+});
+test('signup requires verification and shortcuts do not alter typed values', async () => {
+  authService.logout(); let completed = 0;
+  const screen = render(React.createElement(LoginScreen, { onLoginSuccess: () => completed++ })); await delay(30);
+  await send(screen, '\x14'); await send(screen, 'Fixture'); await send(screen, '\r');
+  await send(screen, 'signup@example.invalid'); await send(screen, '\r');
+  await send(screen, 'fixture-password'); await send(screen, '\r');
+  await waitFor(() => screen.lastFrame()?.includes('verify your account'));
+  const request = service.state.requests.find(r => r.route === '/auth/register');
+  assert.equal(request.body.name, 'Fixture'); assert.equal(request.body.email, 'signup@example.invalid');
+  assert.equal(completed, 0); assert.equal(authService.getToken(), undefined); screen.unmount();
+});
+test('forgot-password shortcut and OTP reset preserve fields and sign in once', async () => {
+  let completed = 0;
+  const screen = render(React.createElement(LoginScreen, { onLoginSuccess: () => completed++ })); await delay(30);
+  await send(screen, '\x06'); await send(screen, 'reset@example.invalid'); await send(screen, '\r');
+  await waitFor(() => screen.lastFrame()?.includes('Reset Password'));
+  await send(screen, '000000'); await send(screen, '\t'); await send(screen, 'fixture-password'); await send(screen, '\r');
+  await waitFor(() => completed === 1);
+  const request = service.state.requests.find(r => r.route === '/auth/password/forgot');
+  assert.equal(request.body.email, 'reset@example.invalid'); assert.equal(service.state.requests.filter(r => r.route === '/auth/password/reset').length, 1); screen.unmount();
+});
+test('startup retains login on server failure and offers a working retry', async () => {
+  authService.setToken('fixture-token'); service.state.meStatus = 500;
+  const screen = render(React.createElement(App)); await waitFor(() => screen.lastFrame()?.includes('[R] Retry'));
+  assert.equal(authService.getToken(), 'fixture-token');
+  service.state.meStatus = 200; await send(screen, 'r'); await waitFor(() => screen.lastFrame()?.includes('Join a Room')); screen.unmount();
+});

@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from 'react';
 import { Box, Text } from 'ink';
-import chalk from 'chalk';
 
 export function SplashScreen({ onComplete }) {
   const [dots, setDots] = useState(0);

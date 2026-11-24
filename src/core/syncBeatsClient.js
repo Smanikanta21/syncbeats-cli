@@ -1,312 +1,221 @@
 import { io } from 'socket.io-client';
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
 import { authService } from './authService.js';
 import { syncEngine } from './syncEngine.js';
-import { trackDownloader } from './trackDownloader.js';
+import { trackDownloader, trackSource } from './trackDownloader.js';
 import { audioEngine } from './audioEngine.js';
-
-import { SERVER_URL } from './config.js';
+import { SOCKET_URL, SOCKET_PATH } from './config.js';
+import { adaptiveParameters, selectClockOffset } from './syncParameters.js';
 
 export class SyncBeatsClient extends EventEmitter {
-  constructor() {
-    super();
-    this.socket = null;
-    this.roomState = null;
-    this.roomId = null;
-    this.pingInterval = null;
+  constructor({ auth = authService, sync = syncEngine, downloader = trackDownloader, audio = audioEngine, socketFactory = io } = {}) {
+    super(); this.auth = auth; this.sync = sync; this.downloader = downloader; this.audio = audio; this.socketFactory = socketFactory;
+    this.socket = null; this.roomState = null; this.roomId = null; this.loaded = null;
+    this.generation = 0; this.pendingSchedule = null; this.activeSchedule = null; this.pingInterval = null;
+    this.onAudioError = error => { this.sync.stop(); this.pendingSchedule = null; this.reportError(error); };
+    this.onEnded = () => {
+      if (this.roomState?.isPlaying) this.emitCommand('playback:ended', {
+        trackUrl: this.roomState.trackUrl, playbackInstanceId: this.roomState.playbackInstanceId,
+      });
+      this.sync.stop();
+    };
   }
-
+  reportError(error) { this.emit('clientError', error instanceof Error ? error : new Error(error?.message || 'The room request failed.')); }
   connect() {
     if (this.socket) return;
-    
-    const token = authService.getToken();
-    if (!token) throw new Error('Cannot connect socket: not authenticated');
-
-    this.socket = io(SERVER_URL, {
-      auth: { token },
-      extraHeaders: {
-        'x-device-id': authService.deviceKey
-      }
+    if (!this.auth.getToken()) throw new Error('Sign in before connecting to a room.');
+    this.audio.on('error', this.onAudioError); this.audio.on('ended', this.onEnded);
+    this.socket = this.socketFactory(SOCKET_URL, {
+      autoConnect: false, path: SOCKET_PATH,
+      auth: { token: this.auth.getToken() }, extraHeaders: { 'x-device-id': this.auth.deviceKey, 'x-client-device': 'SyncBeats CLI' },
+      transports: ['websocket', 'polling'], tryAllTransports: true, timeout: 8000,
     });
-
-    this.socket.on('connect', () => {
-      this.emit('connected');
-      this.socket.emit('device:register', { deviceKey: authService.deviceKey });
+    const socket = this.socket;
+    socket.io.on('reconnect_attempt', () => { socket.auth = { token: this.auth.getToken() }; });
+    socket.on('connect', () => {
+      this.emit('connectionStatus', 'connected'); this.emit('connected');
+      socket.emit('device:register', { deviceKey: this.auth.deviceKey });
+      if (this.roomId) this._join();
       this._startNTP();
     });
-
-    this.socket.on('disconnect', () => {
-      this.emit('disconnected');
-      this._stopNTP();
+    socket.on('disconnect', () => {
+      this._stopNTP(); this.pendingSchedule = null; this.activeSchedule = null; this.generation++;
+      this.sync.pause(this.sync.getExpectedPositionSec()); this.emit('connectionStatus', 'reconnecting');
     });
-
-    // Room Sync Events
-    this.socket.on('room:snapshot', (snapshot) => {
-      this.roomState = snapshot;
-      this.roomId = snapshot.roomId;
-      this.emit('roomState', snapshot);
-      this._handleTrackUpdate(snapshot);
+    socket.on('connect_error', error => { this.emit('connectionStatus', 'offline'); this.reportError(new Error(error.message || 'Could not connect to the room server.')); });
+    socket.on('error', payload => this.reportError(payload));
+    socket.on('room:joinPendingApproval', () => this.emit('connectionStatus', 'awaiting approval'));
+    socket.on('room:joinApproved', () => this.emit('connectionStatus', 'connected'));
+    socket.on('room:joinDenied', () => { this.emit('connectionStatus', 'join denied'); this.reportError(new Error('The host declined your join request. Choose another room.')); });
+    socket.on('room:snapshot', snapshot => this._snapshot(snapshot));
+    socket.on('room:stateChanged', snapshot => this._snapshot(snapshot));
+    socket.on('room:trackSet', payload => {
+      if (!this._forRoom(payload)) return;
+      this._ensureTrack(payload.trackUrl).catch(error => this.reportError(error));
     });
-
-    this.socket.on('room:stateChanged', (snapshot) => {
-      this.roomState = snapshot;
-      this.emit('roomState', snapshot);
+    socket.on('playback:schedule', payload => {
+      if (!this._forRoom(payload)) return;
+      this.roomState = { ...this.roomState, ...payload, state: 'PLAYING', isPlaying: true };
+      this.emit('roomState', this.roomState); this._schedule(payload);
     });
-
-    this.socket.on('room:trackSet', (payload) => {
-      // payload = { trackUrl, trackId }
-      this._handleTrackUpdate(payload);
+    socket.on('playback:pause', payload => {
+      if (!this._forRoom(payload)) return;
+      this.pendingSchedule = null; this.activeSchedule = null;
+      const position = Number.isFinite(payload.positionMs) ? payload.positionMs / 1000
+        : Number.isFinite(payload.pauseOffset) ? payload.pauseOffset : Number.isFinite(payload.position) ? payload.position / 1000 : 0;
+      this.roomState = { ...this.roomState, state: 'PAUSED', isPlaying: false, startEpoch: null, pauseOffset: position };
+      this.sync.pause(position); this.emit('buffering', false); this.emit('roomState', this.roomState);
     });
-
-    trackDownloader.on('error', (err) => {
-      this.emit('error', err);
-    });
-
-    this.socket.on('playback:schedule', (payload) => {
-      // payload = { startEpoch, fromPosition, trackUrl, atEpoch }
+    socket.on('room:participantJoined', participant => {
       if (this.roomState) {
-        this.roomState.state = 'playing';
-      }
-      this.emit('buffering', false);
-      const url = payload.trackUrl || this.roomState?.trackUrl;
-      let trackId = url;
-      if (url && url.startsWith('youtube:')) {
-        trackId = url.split(':')[1];
-      } else if (url) {
-        trackId = url.split('=').pop();
-      } else {
-        trackId = 'unknown';
-      }
-      const localPath = `${process.cwd()}/music/${trackId}.m4a`;
-      syncEngine.schedule(payload, localPath);
-    });
-
-    this.socket.on('playback:pause', (payload) => {
-      if (this.roomState) {
-        this.roomState.state = 'PAUSED';
-        this.roomState.isPlaying = false;
-        if (payload.positionMs) {
-          this.roomState.pauseOffset = payload.positionMs;
-        }
-      }
-      this.emit('buffering', false);
-      const pos = payload.position || payload.positionMs || 0;
-      syncEngine.pause(pos / 1000);
-      this.emit('drift', { expected: pos / 1000, actual: 0, tier: 'synced' });
-      this.emit('roomState', { ...this.roomState });
-    });
-
-    this.socket.on('sync:pong', (payload) => {
-      const t3 = Date.now();
-      const rtt = (t3 - payload.t0) - (payload.t2 - payload.t1);
-      const offset = ((payload.t1 - payload.t0) + (payload.t2 - t3)) / 2;
-      syncEngine.setClockOffset(offset, rtt);
-    });
-
-    // Room Participants
-    this.socket.on('room:participantJoined', (p) => {
-      if (this.roomState) {
-        this.roomState.participants.push(p);
+        this.roomState.participants = [...(this.roomState.participants || []).filter(p => p.socketId !== participant.socketId), participant];
         this.emit('roomState', this.roomState);
       }
     });
-
-    this.socket.on('room:participantLeft', (payload) => {
-      if (this.roomState) {
-        this.roomState.participants = this.roomState.participants.filter(x => x.socketId !== payload.socketId);
-        this.emit('roomState', this.roomState);
-      }
+    socket.on('room:participantLeft', payload => {
+      const socketId = typeof payload === 'string' ? payload : payload.socketId;
+      if (this.roomState) { this.roomState.participants = (this.roomState.participants || []).filter(p => p.socketId !== socketId); this.emit('roomState', this.roomState); }
     });
-    
-    this.socket.on('room:queueChanged', (payload) => {
-       if (this.roomState) {
-           this.roomState.queue = Array.isArray(payload) ? payload : (payload?.queue || []);
-           this.emit('roomState', this.roomState);
-       }
+    socket.on('room:queueChanged', payload => {
+      if (!this.roomState || !this._forRoom(payload)) return;
+      this.roomState.queue = Array.isArray(payload) ? payload : payload.queue || [];
+      if (payload.repeatMode) this.roomState.repeatMode = payload.repeatMode;
+      this.emit('roomState', this.roomState);
     });
-
-    audioEngine.on('ended', () => {
-      // When audio finishes playing naturally
-      if (this.roomId && this.roomState?.trackUrl) {
-        this.socket.emit('playback:ended', { roomId: this.roomId, trackUrl: this.roomState.trackUrl });
-      }
+    socket.on('room:reset', payload => {
+      if (this._forRoom(payload)) { this.generation++; this.loaded = null; this.pendingSchedule = null; this.activeSchedule = null; this.sync.stop(); }
     });
+    socket.connect();
   }
-
+  _forRoom(payload) {
+    return (!payload?.roomId || payload.roomId === this.roomId)
+      && (!payload?.roomInstanceId || !this.roomState?.roomInstanceId || payload.roomInstanceId === this.roomState.roomInstanceId);
+  }
+  _snapshot(snapshot) {
+    if (snapshot.roomId !== this.roomId) return;
+    if (snapshot.roomInstanceId && snapshot.roomInstanceId !== this.roomState?.roomInstanceId) {
+      this.generation++; this.loaded = null; this.pendingSchedule = null; this.activeSchedule = null; this.sync.stop();
+    }
+    this.roomState = snapshot; this.emit('roomState', snapshot);
+    if (!snapshot.trackUrl) {
+      this.generation++; this.pendingSchedule = null; this.activeSchedule = null; this.loaded = null; this.sync.stop(); this.emit('buffering', false); return;
+    }
+    if (snapshot.isPlaying || snapshot.state?.toUpperCase() === 'PLAYING') {
+      this._schedule({ ...snapshot, atEpoch: snapshot.startEpoch + (snapshot.pauseOffset || 0) * 1000, fromPosition: snapshot.pauseOffset || 0 });
+    } else {
+      this.pendingSchedule = null; this.activeSchedule = null; this.sync.pause(snapshot.pauseOffset ?? (snapshot.position || 0) / 1000);
+      this._ensureTrack(snapshot.trackUrl).catch(error => this.reportError(error));
+    }
+  }
   async createRoom(roomId) {
-    const token = authService.getToken();
-    try {
-      // Check if room already exists to prevent backend 500 Unique Constraint errors
-      const checkRes = await fetch(`${SERVER_URL}/rooms/${roomId}`, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      if (checkRes.ok) {
-        return; // Room already exists
-      }
-
-      await fetch(`${SERVER_URL}/rooms`, {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({ roomId })
-      });
-    } catch (e) {
-      // Silently ignore network errors here, joinRoom will handle failures
-    }
+    try { return await this.auth._request(`/rooms/${encodeURIComponent(roomId)}`); }
+    catch (error) { if (error.status !== 404) throw error; }
+    return this.auth._request('/rooms', { method: 'POST', body: JSON.stringify({ roomId }) });
   }
-
+  async getDefaultRoom() {
+    const data = await this.auth._request('/rooms/mine');
+    if (data.rooms?.length) return data.rooms[0].id;
+    return (await this.auth._request('/rooms/default', { method: 'POST', body: '{}' })).roomId;
+  }
   joinRoom(roomId) {
-    if (!this.socket) this.connect();
+    if (typeof roomId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(roomId)) throw new Error('Enter a valid room code.');
+    if (this.roomId && this.roomId !== roomId && this.socket?.connected) this.socket.emit('room:leave', { roomId: this.roomId });
+    this.generation++; this.pendingSchedule = null; this.activeSchedule = null; this.roomState = null; this.loaded = null; this.sync.stop();
     this.roomId = roomId;
-    const user = authService.getUser();
-    this.socket.emit('room:join', { 
-      roomId, 
-      displayName: user?.name || 'Terminal User',
-      userId: user?.id
-    });
+    if (!this.socket) this.connect(); else if (this.socket.connected) this._join();
   }
-
+  _join() { this.socket.emit('room:join', { roomId: this.roomId, displayName: this.auth.getUser()?.name || 'Terminal User', userId: this.auth.getUser()?.id, deviceId: this.auth.deviceKey, deviceName: 'SyncBeats CLI' }); }
   async searchTracks(query) {
-    if (!this.roomId) return [];
-    const token = authService.getToken();
-    try {
-      const res = await fetch(`${SERVER_URL}/rooms/${this.roomId}/youtube-search?q=${encodeURIComponent(query)}`, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-      const data = await res.json();
-      return Array.isArray(data) ? data : (data.videos || []);
-    } catch (err) {
-      console.error(err);
-      return [];
-    }
+    if (!this.roomId) throw new Error('Join a room before searching.');
+    const data = await this.auth._request(`/rooms/${encodeURIComponent(this.roomId)}/youtube-search?q=${encodeURIComponent(query)}`);
+    return Array.isArray(data) ? data : data.videos || [];
   }
-
-  async enqueueTrack(vid) {
-    if (!this.roomId || !vid) return;
-    const token = authService.getToken();
-
-    try {
-      const res = await fetch(`${SERVER_URL}/rooms/${this.roomId}/enqueue-youtube`, {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({
-          youtubeUrl: vid.url,
-          title: vid.title
-        })
-      });
-      if (!res.ok) {
-        const errorData = await res.json();
-        console.error('Enqueue error:', errorData);
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  }
-
-  togglePlayPause() {
-    const state = this.roomState?.state?.toUpperCase();
-    if (state === 'PLAYING' || this.roomState?.isPlaying) {
-      this.socket.emit('playback:pause', { roomId: this.roomId });
-    } else {
-      this.socket.emit('playback:play', { roomId: this.roomId });
-    }
-  }
-
-  sendControls(action) {
-     if (!this.roomId) return;
-     if (action === 'pause') {
-       this.socket.emit('playback:pause', { roomId: this.roomId });
-     }
-     if (action === 'play') {
-       this.socket.emit('playback:play', { roomId: this.roomId });
-     }
-     if (action === 'next') {
-       this.socket.emit('room:nextTrack', { roomId: this.roomId });
-     }
-     if (action === 'prev') {
-       this.socket.emit('room:prevTrack', { roomId: this.roomId });
-     }
-  }
-
-  jumpToQueueItem(trackId) {
-    if (!this.roomId) return;
-    this.socket.emit('playback:jumpTo', { roomId: this.roomId, trackId });
-  }
-
-  toggleRepeat() {
-    if (!this.roomId || !this.roomState) return;
-    const currentMode = this.roomState.repeatMode || 'off';
-    const nextMode = currentMode === 'off' ? 'all' : currentMode === 'all' ? 'track' : 'off';
-    this.socket.emit('room:settings', { 
-      roomId: this.roomId, 
-      shuffle: this.roomState.shuffle || false, 
-      repeatMode: nextMode 
+  async enqueueTrack(video) {
+    if (!this.roomId || !video?.url) throw new Error('Choose a valid search result.');
+    return this.auth._request(`/rooms/${encodeURIComponent(this.roomId)}/enqueue-youtube`, {
+      method: 'POST', body: JSON.stringify({ youtubeUrl: video.url, title: video.title }),
     });
   }
-
-  async _handleTrackUpdate(payload) {
-    let url = payload.trackUrl;
-    if (!url) return;
-    
-    this.emit('buffering', true);
-    
-    let trackId = url;
-    if (url.startsWith('youtube:')) {
-      const videoId = url.split(':')[1];
-      url = `/rooms/${this.roomId}/yt-proxy?videoId=${videoId}`;
-      trackId = videoId;
-    } else {
-      trackId = url.split('=').pop(); 
+  emitCommand(event, payload = {}) {
+    if (!this.socket?.connected || !this.roomId || !this.roomState) {
+      this.reportError(new Error('Wait until you are connected to the room before using playback controls.')); return false;
     }
-    
-    const filePath = await trackDownloader.download(url, trackId);
-    if (filePath) {
-      this.socket.emit('room:clientReady', { roomId: this.roomId });
-      
-      // If the room is already playing (e.g. late join), start playback immediately
-      // instead of waiting for playback:schedule, because the server won't send it again.
-      const isPlaying = payload.state === 'playing' || payload.state === 'PLAYING' || payload.isPlaying || this.roomState?.isPlaying;
-      if (isPlaying) {
-        this.emit('buffering', false);
-        syncEngine.schedule({
-          startEpoch: payload.startEpoch || this.roomState?.startEpoch,
-          fromPosition: payload.positionMs || payload.pauseOffset || this.roomState?.pauseOffset || 0,
-          trackUrl: payload.trackUrl,
-          atEpoch: Date.now() // start instantly
-        }, filePath);
-      } else if (payload.state === 'PAUSED' || payload.state === 'paused') {
-        this.emit('buffering', false);
-        const pos = payload.positionMs || payload.position || 0;
-        this.emit('drift', { expected: pos / 1000, actual: 0 });
-      } else if (this.roomState && !this.roomState.pendingPlay) {
-        // If the room is not pending an auto-play (meaning it's just paused),
-        // clear the buffering state so the user sees the Paused UI instead of getting stuck.
-        this.emit('buffering', false);
-        // Force the UI to show the correct paused time instead of 0s
-        const expectedSec = (payload.pauseOffset || this.roomState?.pauseOffset || 0) / 1000;
-        syncEngine.emit('drift', { expected: expectedSec, tier: 'synced' });
-      }
-    }
+    this.socket.emit(event, { roomId: this.roomId, ...payload }); return true;
   }
-
+  togglePlayPause() { this.emitCommand(this.roomState?.isPlaying ? 'playback:pause' : 'playback:play'); }
+  sendControls(action) {
+    if (['play', 'pause', 'next', 'prev'].includes(action)) this.emitCommand(`playback:${action}`);
+  }
+  jumpToQueueItem(trackId) { this.emitCommand('playback:jumpTo', { trackId }); }
+  toggleRepeat() {
+    const current = this.roomState?.repeatMode || 'off';
+    this.emitCommand('room:toggleRepeat', { repeatMode: current === 'off' ? 'all' : current === 'all' ? 'track' : 'off' });
+  }
+  async _ensureTrack(trackUrl) {
+    const identity = trackSource(trackUrl, this.roomId).id;
+    if (this.loaded?.identity === identity && fs.existsSync(this.loaded.file)) {
+      this.socket?.emit('room:clientReady', { roomId: this.roomId, trackUrl }); this.emit('buffering', false); return this.loaded.file;
+    }
+    if (this.loading?.identity === identity && this.loading.generation === this.generation) return this.loading.promise;
+    const generation = ++this.generation;
+    this.loaded = null; this.activeSchedule = null; this.sync.pause(this.roomState?.isPlaying ? 0 : this.roomState?.pauseOffset || 0); this.emit('buffering', true);
+    const promise = this.downloader.download(trackUrl, this.roomId).then(file => {
+      if (generation !== this.generation || !this.socket?.connected) return null;
+      this.loaded = { identity, file };
+      this.socket.emit('room:clientReady', { roomId: this.roomId, trackUrl });
+      this.emit('buffering', false); return file;
+    }).catch(error => {
+      if (generation === this.generation) { this.emit('buffering', false); throw error; }
+      return null;
+    }).finally(() => { if (this.loading?.generation === generation) this.loading = null; });
+    this.loading = { identity, generation, promise }; return promise;
+  }
+  _schedule(payload) {
+    const trackUrl = payload.trackUrl || this.roomState?.trackUrl;
+    const key = `${trackUrl}:${payload.playbackInstanceId || ''}:${payload.startEpoch}`;
+    if (this.activeSchedule === key) return;
+    this.pendingSchedule = { payload, key };
+    this._ensureTrack(trackUrl).then(file => {
+      if (!file || this.pendingSchedule?.key !== key || this.activeSchedule === key) return;
+      this.sync.schedule(this.pendingSchedule.payload, file); this.activeSchedule = key; this.pendingSchedule = null;
+    }).catch(error => this.reportError(error));
+  }
   _startNTP() {
     this._stopNTP();
-    this.pingInterval = setInterval(() => {
-      this.socket.emit('sync:ping', { t0: Date.now() });
-    }, 2000);
+    let sequence = 0;
+    const run = async () => {
+      const samples = [];
+      for (let i = 0; i < this.sync.params.samples && this.socket?.connected && this.ntpRun === run; i++) {
+        const socket = this.socket, seq = ++sequence, t0 = Date.now();
+        const sample = await new Promise(resolve => {
+          const onPong = payload => {
+            if (payload.seq !== seq || payload.t0 !== t0) return;
+            clearTimeout(timeout); socket.off('sync:pong', onPong);
+            const t3 = Date.now();
+            resolve({ rtt: t3 - t0 - (payload.t2 - payload.t1), offset: ((payload.t1 - t0) + (payload.t2 - t3)) / 2 });
+          };
+          const timeout = setTimeout(() => { socket.off('sync:pong', onPong); resolve(null); }, 1000);
+          socket.on('sync:pong', onPong); socket.emit('sync:ping', { t0, seq });
+        });
+        if (sample && Number.isFinite(sample.rtt) && sample.rtt >= 0 && Number.isFinite(sample.offset)) samples.push(sample);
+        if (i + 1 < this.sync.params.samples) await new Promise(resolve => setTimeout(resolve, this.sync.params.pingGap));
+      }
+      if (!this.socket?.connected || this.ntpRun !== run) return;
+      const offset = selectClockOffset(samples, this.sync.params.rttGate, !this.sync.clockReady);
+      const stats = adaptiveParameters(samples, this.sync.params);
+      if (offset != null) this.sync.setClockOffset(offset, stats.latency);
+      this.sync.setParameters(stats.params);
+      if (stats.latency != null && this.roomId) this.socket.emit('sync:stats', { roomId: this.roomId, latency: stats.latency, jitter: stats.jitter });
+      this.pingInterval = setTimeout(run, this.sync.params.resync);
+    };
+    this.ntpRun = run; run().catch(error => this.reportError(error));
   }
-
-  _stopNTP() {
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
-    }
+  _stopNTP() { if (this.pingInterval) clearTimeout(this.pingInterval); this.pingInterval = null; this.ntpRun = null; }
+  disconnect() {
+    this._stopNTP(); this.generation++; this.pendingSchedule = null; this.activeSchedule = null; this.loaded = null;
+    this.downloader.cancelAll(); this.audio.off('error', this.onAudioError); this.audio.off('ended', this.onEnded);
+    this.socket?.removeAllListeners(); this.socket?.disconnect(); this.socket = null; this.sync.stop();
   }
 }
-
 export const syncBeatsClient = new SyncBeatsClient();

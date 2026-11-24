@@ -1,210 +1,116 @@
-# SyncBeats Terminal Player
+# SyncBeats CLI
 
-A terminal-based music player that syncs playback across devices in real-time using [SyncBeats](https://github.com/Smanikanta21/syncbeats) rooms. Search YouTube, queue tracks, and listen in perfect sync — all from your terminal.
-
-> **Platform Support: macOS and Linux only.** Windows is not supported.
-
----
-
-## Quick Install
-
-```bash
-curl -fsSL https://syncbeats-server-1006171035854.asia-south1.run.app/cli | bash
-```
-
-Or manually:
-
-```bash
-git clone https://github.com/Smanikanta21/CLI-music-player.git
-cd CLI-music-player
-npm install
-npm run build
-npm start
-```
-
----
+A terminal client for [SyncBeats](https://www.syncbeats.in). Sign in, join a room, search YouTube, manage the shared queue, and play downloaded audio with FFplay.
 
 ## Requirements
 
-| Dependency | Version | Install |
-|---|---|---|
-| **Node.js** | >= 18.0.0 | [nodejs.org](https://nodejs.org) |
-| **npm** | >= 9.0.0 | Comes with Node.js |
-| **ffplay** | Any | `brew install ffmpeg` (macOS) or `sudo apt install ffmpeg` (Linux) |
-| **Git** | Any | `brew install git` (macOS) or `sudo apt install git` (Linux) |
+- Node.js 22 or newer
+- FFmpeg, including the `ffplay` command
+- A SyncBeats account and a connection to its backend
 
-> `ffplay` is part of the `ffmpeg` suite and is used as the audio backend for playback.
-
----
-
-## How It Works
-
-SyncBeats Terminal Player connects to the SyncBeats backend server via **WebSockets (Socket.IO)** and synchronizes music playback across all connected clients (mobile app, web app, and this terminal player) in real-time.
-
-### Architecture
-
-```
-+─────────────────────────+
-|   SyncBeats Terminal    |
-|   Player (this app)     |
-|                         |
-|  +───────────────────+  |
-|  |   Ink/React UI    |  |  <- Terminal UI rendered with Ink
-|  +────────┬──────────+  |
-|           |              |
-|  +────────v──────────+  |
-|  | SyncBeatsClient   |  |  <- Socket.IO connection + REST API calls
-|  +────────┬──────────+  |
-|           |              |
-|  +────────v──────────+  |
-|  |   SyncEngine      |  |  <- NTP clock sync + drift correction
-|  +────────┬──────────+  |
-|           |              |
-|  +────────v──────────+  |
-|  |   AudioEngine     |  |  <- Spawns ffplay child process
-|  +────────┬──────────+  |
-|           |              |
-|  +────────v──────────+  |
-|  |  TrackDownloader   |  |  <- Downloads .m4a from server
-|  +───────────────────+  |
-+───────────┬─────────────+
-            | WebSocket + HTTPS
-            v
-+─────────────────────────+
-|   SyncBeats Backend     |
-|   (Cloud Run)           |
-|                         |
-|  - Room management      |
-|  - Queue & playback     |
-|  - YouTube search       |
-|  - NTP clock sync       |
-|  - User authentication  |
-+─────────────────────────+
-```
-
-### Playback Flow
-
-1. **Login/Register** - Authenticate with the SyncBeats backend
-2. **Room Selection** - Join an existing room (fetched from your account) or auto-join
-3. **Search & Queue** - Search YouTube directly from the terminal, enqueue tracks
-4. **Download** - When a track is set, the terminal player downloads the `.m4a` audio file from the server to a local `music/` cache
-5. **Synchronized Play** - The backend broadcasts a `playback:schedule` event with a precise `startEpoch` timestamp. All clients start playback at the exact same moment using NTP-synced clocks
-6. **Drift Correction** - A background loop checks the expected vs actual playback position and corrects drift
-
-### Clock Synchronization
-
-The terminal player implements NTP-style clock synchronization:
-
-- Sends `sync:ping` with a timestamp `t0`
-- Server responds with `sync:pong` containing `t0`, `t1` (server receive), `t2` (server send)
-- Client calculates:
-  - **RTT** = `(t3 - t0) - (t2 - t1)` (round-trip time minus server processing)
-  - **Clock Offset** = `((t1 - t0) + (t2 - t3)) / 2`
-- All playback scheduling uses `Date.now() + clockOffset` to align with server time
-
----
-
-## Keybindings
-
-| Key | Action |
-|---|---|
-| `Space` | Play / Pause |
-| `N` | Next track |
-| `P` | Previous track |
-| `S` | Open YouTube search |
-| `M` | Focus queue (navigate with Up/Down, Enter to play) |
-| `R` | Toggle repeat mode (off -> all -> track) |
-| `Q` | Quit |
-| `Esc` | Close search / Unfocus queue |
-| `Up` / `Down` | Navigate search results or queue items |
-| `Enter` | Select search result / Play queue item |
-
----
-
-## Project Structure
-
-```
-terminal-player/
-├── bin/
-│   └── index.js          # Entry point (imports built dist)
-├── src/
-│   ├── index.js           # App bootstrap (Ink render)
-│   ├── core/
-│   │   ├── config.js            # Central SERVER_URL config (env-based)
-│   │   ├── syncBeatsClient.js   # Socket.IO client + REST API
-│   │   ├── syncEngine.js        # NTP clock sync + drift correction
-│   │   ├── audioEngine.js       # ffplay child process manager
-│   │   ├── trackDownloader.js   # HTTP file downloader with progress
-│   │   └── authService.js       # JWT auth + device registration
-│   └── ui/
-│       ├── PlayerScreen.js      # Main player UI (Now Playing, Queue, Stats)
-│       ├── RoomSelectScreen.js  # Room picker screen
-│       ├── LoginScreen.js       # Login/Register form
-│       └── App.js               # Screen router
-├── music/                 # Cached audio files (gitignored)
-├── dist/                  # esbuild output (gitignored)
-├── package.json
-└── .gitignore
-```
-
----
-
-## Configuration
-
-The app stores auth tokens and device keys using [Configstore](https://github.com/yeoman/configstore) at:
-
-```
-~/.config/configstore/syncbeats-terminal.json
-```
-
-
-By default the terminal player connects to the production SyncBeats backend. Override with an environment variable:
+On macOS:
 
 ```bash
-# Development (local server)
-SYNCBEATS_SERVER_URL=http://localhost:4000 npm run dev
-
-# Production (default if not set)
-npm run dev
+brew install ffmpeg
 ```
 
----
-
-## Development
+On Debian/Ubuntu:
 
 ```bash
-# Clone
-git clone https://github.com/Smanikanta21/CLI-music-player.git
-cd CLI-music-player
+sudo apt install ffmpeg
+```
 
-# Install dependencies
-npm install
+## Run from source
 
-# Build and run (rebuilds src/ -> dist/ via esbuild, then starts)
-npm run dev
-
-# Run without rebuilding (uses existing dist/)
+```bash
+git clone https://github.com/Smanikanta21/syncbeats-cli.git
+cd syncbeats-cli
+npm ci
 npm start
 ```
 
-### Build System
-
-Uses [esbuild](https://esbuild.github.io/) to bundle JSX/ESM source into a single `dist/index.js`:
+Dependency installation builds the terminal bundle. For development:
 
 ```bash
-esbuild src/index.js --bundle --platform=node --format=esm --outfile=dist/index.js --loader:.js=jsx --packages=external
+npm run dev
 ```
 
----
+The CLI uses `https://api.syncbeats.in` by default. For a local server:
 
-## Related Projects
+```bash
+SYNCBEATS_SERVER_URL=http://localhost:4000 npm start
+```
 
-- **[SyncBeats Backend](https://github.com/Smanikanta21/syncbeats)** — Node.js/Express server with Socket.IO, Prisma, and YouTube integration
-- **SyncBeats Mobile App** — React Native companion app
-- **SyncBeats Web App** — Next.js web frontend
+The base URL can include an HTTP proxy prefix, such as `https://www.syncbeats.in/api`; Socket.IO will use `/api/socket.io` on that origin.
 
----
+## Sign in and choose a room
 
-## License
+Use Tab/Shift+Tab or Enter to move through fields; Enter on the last field submits once.
 
-ISC
+- Ctrl+T switches between login and signup. Signup requires the email verification link before login.
+- Ctrl+F starts an emailed OTP password reset.
+- Ctrl+G opens browser sign-in, including Google sign-in when offered by the web app. Finish login in that browser window; Esc cancels the terminal handoff. The loopback callback has a random address and verifies the returned token before saving it.
+- If the web app redirects an already authenticated browser away from its login page, use terminal email login or retry browser sign-in in a browser session that shows the login form.
+- A temporary server error preserves your saved session and offers Retry.
+
+Enter a room code, or leave it empty to use your own existing/server-assigned room. Room errors and private-room approval status appear in the terminal.
+
+## Player controls
+
+| Key | Action |
+| --- | --- |
+| Space | Play / pause |
+| N / P | Next / previous track |
+| R | Cycle repeat: off, all, track |
+| M | Focus queue; arrows select, Enter plays |
+| S | Search; arrows select a result, Enter enqueues |
+| Esc | Leave search/queue mode |
+| B | Choose another room |
+| Q / Ctrl+C | Quit and restore the terminal |
+
+Commands round-trip through the backend. Offline controls are rejected rather than buffered. After reconnecting, the client rejoins the room and redeclares readiness for cached audio.
+
+## Audio and synchronization
+
+Audio downloads share in-flight work and become available through an atomic rename only after the stream completes. Playback uses the downloader's returned path for uploaded files and metadata-bearing YouTube URLs. Cached audio lives in the operating system's cache directory, not the shell's current working directory.
+
+The client uses NTP bursts, RTT filtering and adaptive parameters ported from the web client. Scheduled playback waits for the server epoch; late arrivals seek to the current timeline. FFplay's reported media clock supplies the measured drift. Hard seeks use observed decoder launch latency and a cooldown; playback speed stays at 1.0.
+
+FFplay process startup and the audio device affect timing. This implementation measures/corrects drift; **physical multi-device alignment below 25ms has not been certified**. Real speaker/network testing is still required. An unknown audio clock is shown as measuring rather than synced.
+
+Environment overrides:
+
+| Variable | Purpose |
+| --- | --- |
+| `SYNCBEATS_SERVER_URL` | Backend HTTP base URL |
+| `SYNCBEATS_APP_URL` | Web login origin for browser handoff |
+| `SYNCBEATS_CACHE_DIR` | Audio cache root |
+| `XDG_CONFIG_HOME` | Configstore root for device/session storage |
+| `XDG_CACHE_HOME` | Cache root on systems honoring XDG paths |
+
+There is no background Git updater. Update deliberately:
+
+```bash
+git pull --ff-only
+npm ci
+```
+
+## Verification and packaging
+
+```bash
+npm test
+npm run build
+npm audit
+npm pack
+```
+
+The regression suite exercises the actual CLI against local HTTP/Socket.IO fixtures, terminal input, scheduled/paused playback, download failures, reconnects, browser callback validation, and the npm artifact. It uses fake local accounts and sends no live emails. The real AAC decoder test uses SDL's dummy audio driver and is skipped if FFmpeg/FFplay are absent.
+
+`npm pack` includes the compiled `dist/index.js`. A Git installation runs the prepare build; a packed installation runs the already compiled bundle. Help/version commands work without opening the terminal UI:
+
+```bash
+syncbeats --help
+syncbeats --version
+```
+
+Live Google consent, email delivery, real YouTube extraction, physical speaker timing, and other operating systems still need manual verification. See [VERIFICATION.md](VERIFICATION.md) for the fix record.
